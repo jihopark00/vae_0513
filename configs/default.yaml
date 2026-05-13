@@ -19,6 +19,8 @@ vis_only: false
 ema_rate: 0.999
 grad_checkpointing: false
 
+reconstruction_loss: l1          # l1 | l2 | l2+l1
+reconstruction_weight: 1.0
 perceptual_loss: lpips-convnext_s-1.0-0.1
 perceptual_weight: 1.0
 discriminator_start_epoch: 100

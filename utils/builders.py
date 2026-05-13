@@ -325,6 +325,8 @@ def create_optimizer_and_scaler(args, model, print_trainable_params=False):
 
 def create_loss_module(args):
     loss_module = losses.ReconstructionLoss(
+        reconstruction_loss=getattr(args, "reconstruction_loss", "l2"),
+        reconstruction_weight=getattr(args, "reconstruction_weight", 1.0),
         discriminator_start_epoch=getattr(args, "discriminator_start_epoch", 20),
         discriminator_weight=getattr(args, "discriminator_weight", 0.1),
         perceptual_loss=getattr(args, "perceptual_loss", "lpips-convnext_s-1.0-0.1"),
