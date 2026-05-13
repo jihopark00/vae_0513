@@ -202,7 +202,7 @@ def get_args_parser():
     parser.add_argument("--beta2", type=float, default=0.95, help="Beta2 for AdamW optimizer")
 
     # dataset parameters
-    # parser.add_argument("--use_cached_tokens", action="store_true")
+    parser.add_argument("--use_cached_tokens", action="store_true")
     parser.add_argument("--data_path", default="./data/imagenet/train", type=str)
     parser.add_argument("--num_classes", default=1000, type=int)
     parser.add_argument("--class_of_interest", default=[207, 360, 387, 974, 88, 979, 417, 279], type=int, nargs="+")

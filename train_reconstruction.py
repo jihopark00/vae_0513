@@ -196,6 +196,7 @@ def get_args_parser():
     parser.add_argument("--eval_bsz", type=int, default=256)
 
     # dataset parameters
+    parser.add_argument("--use_cached_tokens", action="store_true")
     parser.add_argument("--data_path", default="./data/imagenet/train", type=str)
     parser.add_argument("--num_classes", default=1000, type=int)
     parser.add_argument("--class_of_interest", default=[207, 360, 387, 974, 88, 979, 417, 279], type=int, nargs="+")
