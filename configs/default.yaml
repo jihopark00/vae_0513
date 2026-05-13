@@ -1,0 +1,46 @@
+# DeTok reconstruction training config.
+# Recipe from README: detok_BB, gamma=3.0, mask_ratio=0.7, 200 epochs,
+# discriminator_start_epoch=100, batch_size=32 (per-GPU; global = 32 * 8 * num_nodes).
+#
+# Only the sections consumed by train_reconstruction.py are kept here:
+# model / loss / optimization, plus `seed`. Everything else (logging,
+# checkpointing, dataset, wandb) stays on the CLI.
+
+model: detok_BB
+token_channels: 32
+img_size: 256
+patch_size: 16
+mask_ratio: 0.0
+gamma: 0.0
+use_additive_noise: false
+no_load_ckpt: false
+train_decoder_only: false
+vis_only: false
+ema_rate: 0.999
+grad_checkpointing: false
+
+perceptual_loss: lpips-convnext_s-1.0-0.1
+perceptual_weight: 1.0
+discriminator_start_epoch: 100
+discriminator_weight: 0.1
+kl_loss_weight: 1.0e-6
+use_sigreg: false
+sigreg_weight: 0.01
+sigreg_npoints: 17
+sigreg_nslices: 256
+sigreg_on_mu: false
+
+start_epoch: 0
+epochs: 200
+batch_size: 32
+lr: null
+blr: 1.0e-4
+min_lr: 0.0
+lr_sched: cosine          # constant | cosine
+warmup_rate: 0.25
+weight_decay: 1.0e-4
+grad_clip: 3.0
+beta1: 0.9
+beta2: 0.95
+
+seed: 42
