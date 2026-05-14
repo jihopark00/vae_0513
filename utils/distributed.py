@@ -86,7 +86,10 @@ def _get_available_port() -> int:
 
 @functools.lru_cache
 def enable_distributed():
-    if _is_slurm_job_process():
+    if {"RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"} <= os.environ.keys():
+        # torchrun (or another launcher) already populated the distributed env — trust it
+        pass
+    elif _is_slurm_job_process():
         os.environ["MASTER_ADDR"] = _parse_slurm_node_list(os.environ["SLURM_JOB_NODELIST"])[0]
         os.environ["MASTER_PORT"] = str(random.Random(os.environ["SLURM_JOB_ID"]).randint(20_000, 60_000))
         os.environ["RANK"] = os.environ["SLURM_PROCID"]
