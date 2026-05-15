@@ -299,6 +299,7 @@ def get_args_parser():
     parser.add_argument("--entity", default="YOUR_WANDB_ENTITY", type=str)
     parser.add_argument("--exp_name", default=None, type=str)
     parser.add_argument("--enable_wandb", action="store_true")
+    parser.add_argument("--wandb_key", default=None, type=str)
 
     return parser
 
