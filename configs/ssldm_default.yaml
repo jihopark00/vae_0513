@@ -36,11 +36,23 @@ perceptual_weight: 1.0
 discriminator_start_epoch: 100
 discriminator_weight: 0.1
 kl_loss_weight: 1.0e-6
+kl_loss_reduction: mean        # mean | sum  (reduction over latent dims inside DiagonalGaussianDistribution.kl)
 use_sigreg: false
 sigreg_weight: 0.0
 sigreg_npoints: 17
 sigreg_nslices: 256
 sigreg_on_mu: false
+use_weak_sigreg: false        # 2nd-moment matching (Cov(z) ~ I) via Frobenius
+weak_sigreg_weight: 0.0
+weak_sigreg_sketch_dim: 64    # sketch z down to this dim before Cov(); ignored when latent dim <= sketch_dim
+weak_sigreg_on_mu: false      # true = use posterior mean; false = use sample
+use_var_reg: false            # hinge: F.relu(std - 1) — push per-channel std DOWN to <= 1
+var_reg_weight: 0.0
+var_reg_eps: 1.0e-4
+var_reg_on_mu: false
+use_cov_reg: false            # same target as weak_sigreg but no sketch projection
+cov_reg_weight: 0.0
+cov_reg_on_mu: false
 
 # ===== Optimization =====
 # When separate_optimizers=false: a single optimizer is built over the whole

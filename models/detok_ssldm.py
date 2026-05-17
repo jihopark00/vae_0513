@@ -1,8 +1,8 @@
 """DeTok variant for joint SSL+Diffusion training.
 
-Adds an optional normalization layer applied to the encoder output (the
-moments tensor produced by ``Encoder.latent_head``) before it is split into
-the ``(mean, logvar)`` pair consumed by ``DiagonalGaussianDistribution``.
+Adds an optional normalization layer applied to the **mean** half of the
+moments tensor produced by ``Encoder.latent_head`` (the logvar half is left
+untouched).
 
 Also supports a ``fixed_std`` mode: when set, the encoder's predicted logvar
 is discarded and the posterior std is forced to a fixed scalar value.
@@ -10,11 +10,13 @@ is discarded and the posterior std is forced to a fixed scalar value.
 
 import logging
 import math
+from functools import partial
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+from .autoencoder import DiagonalGaussianDistribution
 from .detok import DeTok
 
 logger = logging.getLogger("DeTok")
@@ -51,11 +53,20 @@ class DeTok_SSLDM(DeTok):
         self,
         latent_norm: str | None = None,
         fixed_std: float | None = None,
+        kl_reduction: str = "sum",
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.latent_norm_kind = latent_norm
         self.fixed_std = fixed_std
+        # override parent's to_posteriors so the chosen reduction over latent
+        # dims is baked into every posterior created via this model.
+        if kl_reduction not in ("sum", "mean"):
+            raise ValueError(f"kl_reduction must be 'sum' or 'mean', got {kl_reduction!r}")
+        self.kl_reduction = kl_reduction
+        self.to_posteriors = partial(
+            DiagonalGaussianDistribution, channel_dim=-1, reduction=kl_reduction,
+        )
 
         if fixed_std is not None:
             assert fixed_std >= 0, f"fixed_std must be non-negative, got {fixed_std}"
@@ -72,24 +83,31 @@ class DeTok_SSLDM(DeTok):
             # then yields std ≈ 1e-6 (near-deterministic, negligible KL).
             safe_std = max(float(fixed_std), 1e-6)
             self._fixed_logvar_value = 2.0 * math.log(safe_std)
+            mean_chans = mean_dim
+        else:
+            # learning logvar: encoder output is (B, L, 2C); mean half is C-dim.
+            mean_chans = self.encoder.token_channels // 2
 
-        # norm runs on the encoder output: full moments (2C) when fixed_std is
-        # None, mean-only (C) when fixed_std is set.
-        self.latent_norm = _build_latent_norm(latent_norm, self.encoder.token_channels)
-        logger.info(f"[DeTok_SSLDM] latent_norm: {latent_norm}, fixed_std: {fixed_std}")
+        # norm runs on the **mean** half only — never on logvar.
+        self.latent_norm = _build_latent_norm(latent_norm, mean_chans)
+        self._mean_chans = mean_chans
+        logger.info(f"[DeTok_SSLDM] latent_norm: {latent_norm} (dim={mean_chans}, applied to mean only), "
+                    f"fixed_std: {fixed_std}, kl_reduction: {kl_reduction}")
 
     def encode(self, x: Tensor, sampling: bool = False, mask_ratio: float = -1, noise_level: float = -1.0):
         z, ids_restore = self.encoder(x, mask_ratio=mask_ratio)
-        z = self.latent_norm(z)
         if self.fixed_std is not None:
-            # encoder.latent_head was rebuilt to output only the mean; build the
-            # moments tensor by appending a constant logvar (clamped at init).
-            mean = z
+            # encoder.latent_head outputs the mean only; norm it directly and
+            # append a constant logvar to form a moments tensor.
+            mean = self.latent_norm(z)
             logvar = torch.full_like(mean, fill_value=self._fixed_logvar_value)
             params = torch.cat([mean, logvar], dim=-1)
-            posteriors = self.to_posteriors(params)
         else:
-            posteriors = self.to_posteriors(z)
+            # split (B, L, 2C) into mean / logvar; norm the mean half only.
+            mean, logvar = z[..., :self._mean_chans], z[..., self._mean_chans:]
+            mean = self.latent_norm(mean)
+            params = torch.cat([mean, logvar], dim=-1)
+        posteriors = self.to_posteriors(params)
         z_latents = posteriors.sample() if sampling else posteriors.mean
 
         if self.training and self.gamma > 0.0:

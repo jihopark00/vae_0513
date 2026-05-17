@@ -22,6 +22,140 @@ from tqdm import tqdm
 from lejepa.multivariate import SlicingUnivariateTest
 from lejepa.univariate import EppsPulley
 
+
+def _all_gather_with_grad(x: Tensor) -> Tensor:
+    """All-gather ``x`` across DDP ranks along dim=0 with autograd support.
+
+    Each rank ends up holding the SAME concatenated tensor of shape
+    ``(world_size * N, ...)``. Gradients flow back to each rank's local slice
+    via PyTorch's ``torch.distributed.nn.functional.all_gather`` (the backward
+    sums gradients across ranks via all-to-all; combined with DDP's gradient
+    averaging in backward, the net effect is a correct global-batch mean).
+
+    Falls back to identity when distributed is not initialized or world == 1.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return x
+    world_size = torch.distributed.get_world_size()
+    if world_size == 1:
+        return x
+    gathered = torch.distributed.nn.functional.all_gather(x.contiguous())
+    return torch.cat(list(gathered), dim=0)
+
+
+class VarRegLoss(nn.Module):
+    """Hinge loss that pushes per-channel std DOWN toward 1.0.
+
+    Inverse of VicReg's variance term:
+    - VicReg:   ``F.relu(1 - std)``   pushes std up to >= 1   (anti-collapse)
+    - VarReg:   ``F.relu(std - 1)``   pushes std down to <= 1 (bounded scale)
+
+    Input ``x: (N, C)`` is **gathered across all DDP ranks first** (so the
+    variance is computed on the full global batch, not per-rank).
+    """
+
+    def __init__(self, eps: float = 1e-4):
+        super().__init__()
+        self.eps = eps
+
+    @torch.autocast("cuda", enabled=False)
+    def forward(self, x: Tensor) -> Tensor:
+        x = x.float()
+        x = _all_gather_with_grad(x)
+        std = torch.sqrt(x.var(dim=0) + self.eps)
+        return torch.mean(F.relu(std - 1.0))
+
+
+class CovRegLoss(nn.Module):
+    """Frobenius distance ``||Cov(x) - I||_F`` — same target as WeakSigregLoss
+    but **without sketch projection**. Use this when the feature dim ``C`` is
+    already small enough to compute the full ``(C, C)`` covariance directly
+    (e.g. per-position token-channel features ``z.reshape(-1, C)``).
+
+    Input ``x: (N, C)`` is **gathered across all DDP ranks first** so the
+    covariance is computed on the full global batch.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    @torch.autocast("cuda", enabled=False)
+    def forward(self, x: Tensor) -> Tensor:
+        x = x.float()
+        x = _all_gather_with_grad(x)
+        N, C = x.size()
+        x = x - x.mean(dim=0, keepdim=True)
+        cov = (x.T @ x) / (N - 1 + 1e-6)
+        target = torch.eye(C, device=x.device, dtype=cov.dtype)
+        return torch.norm(cov - target, p="fro")
+
+
+class WeakSigregLoss(nn.Module):
+    """Forces ``Cov(x) ~ I`` via Frobenius matching of the 2nd moment.
+
+    Optional random sketching matrix ``S`` projects ``(N, C)`` features down to
+    ``sketch_dim`` so the covariance is ``(sketch_dim, sketch_dim)`` regardless
+    of the input dim. The seed combines:
+
+    * a globally-synchronized **train step** counter (incremented every call,
+      synced via ``all_reduce(MAX)`` so all ranks advance together), and
+    * the local **rank** index,
+
+    giving each rank a *different* projection direction per step — an ensemble
+    of sketches across DDP ranks. Each rank computes its own local covariance
+    and Frobenius loss; DDP's gradient all-reduce during backward averages the
+    contributions across GPUs.
+    """
+
+    def __init__(self, sketch_dim: int = 64):
+        super().__init__()
+        self.sketch_dim = sketch_dim
+        self.register_buffer("global_step", torch.tensor(0, dtype=torch.long))
+        self._generator: torch.Generator | None = None
+
+    def _get_generator(self, device: torch.device, seed: int) -> torch.Generator:
+        if self._generator is None or self._generator.device != device:
+            self._generator = torch.Generator(device=device)
+        self._generator.manual_seed(int(seed))
+        return self._generator
+
+    @torch.autocast("cuda", enabled=False)
+    def forward(self, x: Tensor) -> Tensor:
+        x = x.float()
+        N, C = x.size()
+
+        # synchronize step across ranks so all ranks share a monotonic counter
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            step_t = self.global_step.clone()
+            torch.distributed.all_reduce(step_t, op=torch.distributed.ReduceOp.MAX)
+            step = int(step_t.item())
+            rank = torch.distributed.get_rank()
+        else:
+            step = int(self.global_step.item())
+            rank = 0
+        self.global_step.add_(1)
+
+        # per-rank seed -> per-rank projection (ensemble across ranks)
+        seed = step * 1_000_003 + rank
+
+        # 1. sketch (when C > sketch_dim) to bound the covariance size
+        if C > self.sketch_dim:
+            g = self._get_generator(x.device, seed)
+            S = torch.randn(self.sketch_dim, C, device=x.device, generator=g) / (C ** 0.5)
+            x = x @ S.T  # (N, sketch_dim)
+            d = self.sketch_dim
+        else:
+            d = C
+
+        # 2. center + covariance (per-rank batch)
+        x = x - x.mean(dim=0, keepdim=True)
+        cov = (x.T @ x) / (N - 1 + 1e-6)
+
+        # 3. Frobenius distance to identity
+        target = torch.eye(d, device=x.device, dtype=cov.dtype)
+        return torch.norm(cov - target, p="fro")
+
+
 logger = logging.getLogger("DeTok")
 
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -344,6 +478,17 @@ class ReconstructionLoss(nn.Module):
         sigreg_npoints: int = 17,
         sigreg_nslices: int = 100,
         sigreg_on_mu: bool = False,
+        use_weak_sigreg: bool = False,
+        weak_sigreg_weight: float = 0.0,
+        weak_sigreg_sketch_dim: int = 64,
+        weak_sigreg_on_mu: bool = False,
+        use_var_reg: bool = False,
+        var_reg_weight: float = 0.0,
+        var_reg_eps: float = 1e-4,
+        var_reg_on_mu: bool = False,
+        use_cov_reg: bool = False,
+        cov_reg_weight: float = 0.0,
+        cov_reg_on_mu: bool = False,
     ):
         super().__init__()
         self.reconstruction_loss = reconstruction_loss
@@ -372,6 +517,25 @@ class ReconstructionLoss(nn.Module):
             uni = EppsPulley(n_points=self.sigreg_npoints)
             self.sigreg_fn = SlicingUnivariateTest(univariate_test=uni, num_slices=self.sigreg_nslices)
 
+        self.use_weak_sigreg = use_weak_sigreg
+        self.weak_sigreg_weight = weak_sigreg_weight
+        self.weak_sigreg_sketch_dim = weak_sigreg_sketch_dim
+        self.weak_sigreg_on_mu = weak_sigreg_on_mu
+        if self.use_weak_sigreg:
+            self.weak_sigreg_fn = WeakSigregLoss(sketch_dim=self.weak_sigreg_sketch_dim)
+
+        self.use_var_reg = use_var_reg
+        self.var_reg_weight = var_reg_weight
+        self.var_reg_on_mu = var_reg_on_mu
+        if self.use_var_reg:
+            self.var_reg_fn = VarRegLoss(eps=var_reg_eps)
+
+        self.use_cov_reg = use_cov_reg
+        self.cov_reg_weight = cov_reg_weight
+        self.cov_reg_on_mu = cov_reg_on_mu
+        if self.use_cov_reg:
+            self.cov_reg_fn = CovRegLoss()
+
 
             # def build_sigreg_fn(cfg: dict, device: torch.device) -> Optional[nn.Module]:
             #     sr = cfg["loss_config"].get("sigreg_loss", {"use": False})
@@ -391,6 +555,14 @@ class ReconstructionLoss(nn.Module):
         logger.info(f"discriminator start epoch: {self.discriminator_start_epoch}")
         logger.info(f"kl weight: {self.kl_weight}")
         logger.info(f"logvar init: {logvar_init}")
+        if self.use_weak_sigreg:
+            logger.info(f"weak_sigreg: enabled, weight={self.weak_sigreg_weight}, "
+                        f"sketch_dim={self.weak_sigreg_sketch_dim}, on_mu={self.weak_sigreg_on_mu}")
+        if self.use_var_reg:
+            logger.info(f"var_reg: enabled, weight={self.var_reg_weight}, "
+                        f"eps={var_reg_eps}, on_mu={self.var_reg_on_mu}")
+        if self.use_cov_reg:
+            logger.info(f"cov_reg: enabled, weight={self.cov_reg_weight}, on_mu={self.cov_reg_on_mu}")
         logger.info("=====================================")
 
     @torch.autocast("cuda", enabled=False)
@@ -473,11 +645,11 @@ class ReconstructionLoss(nn.Module):
         reconstruction_loss = reconstruction_loss / torch.exp(self.logvar)
         kl_loss = torch.zeros((), device=inputs.device)
         if extra_result_dict is not None:
-            # assume extra_result_dict contains posteriors with kl method
+            # posteriors.kl() returns a (B,) tensor; the per-sample reduction
+            # over latent dims is configured inside DiagonalGaussianDistribution.
             posteriors = extra_result_dict
             if hasattr(posteriors, "kl"):
-                kl_loss = posteriors.kl()
-                kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
+                kl_loss = posteriors.kl().mean()
 
         sigreg_loss = torch.zeros((), device=inputs.device)
         if self.use_sigreg:
@@ -487,7 +659,26 @@ class ReconstructionLoss(nn.Module):
             else:
                 z = posteriors.sample()
             sigreg_loss = self.sigreg_fn(z.flatten(1))
-            
+
+        weak_sigreg_loss = torch.zeros((), device=inputs.device)
+        if self.use_weak_sigreg and extra_result_dict is not None:
+            posteriors = extra_result_dict
+            z = posteriors.mode() if self.weak_sigreg_on_mu else posteriors.sample()
+            weak_sigreg_loss = self.weak_sigreg_fn(z.flatten(1))
+
+        var_reg_loss = torch.zeros((), device=inputs.device)
+        if self.use_var_reg and extra_result_dict is not None:
+            posteriors = extra_result_dict
+            z = posteriors.mode() if self.var_reg_on_mu else posteriors.sample()
+            # per-channel variance over batch + spatial: reshape to (N=B*L, C)
+            var_reg_loss = self.var_reg_fn(z.reshape(-1, z.shape[-1]))
+
+        cov_reg_loss = torch.zeros((), device=inputs.device)
+        if self.use_cov_reg and extra_result_dict is not None:
+            posteriors = extra_result_dict
+            z = posteriors.mode() if self.cov_reg_on_mu else posteriors.sample()
+            # CxC covariance over batch + spatial: reshape to (N=B*L, C)
+            cov_reg_loss = self.cov_reg_fn(z.reshape(-1, z.shape[-1]))
 
         total_loss = (
             reconstruction_loss
@@ -495,6 +686,9 @@ class ReconstructionLoss(nn.Module):
             + self.kl_weight * kl_loss
             + d_weight * d_factor * generator_loss
             + self.sigreg_weight * sigreg_loss
+            + self.weak_sigreg_weight * weak_sigreg_loss
+            + self.var_reg_weight * var_reg_loss
+            + self.cov_reg_weight * cov_reg_loss
         )
 
         loss_dict = {
@@ -508,6 +702,9 @@ class ReconstructionLoss(nn.Module):
             "gan_loss": generator_loss.detach(),
             "psnr": -10 * torch.log10(reconstruction_loss).detach(),
             "sigreg_loss": (self.sigreg_weight * sigreg_loss).detach(),
+            "weak_sigreg_loss": (self.weak_sigreg_weight * weak_sigreg_loss).detach(),
+            "var_reg_loss": (self.var_reg_weight * var_reg_loss).detach(),
+            "cov_reg_loss": (self.cov_reg_weight * cov_reg_loss).detach(),
         }
 
         return total_loss, loss_dict

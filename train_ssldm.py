@@ -171,6 +171,170 @@ def adjust_args_for_dataset(args: argparse.Namespace) -> argparse.Namespace:
 
 
 # =============================================================================
+# Latent-z visualization (PCA feature maps + PCA/t-SNE distribution scatter)
+# =============================================================================
+
+
+def _pca_top_components(X: np.ndarray, n_components: int):
+    """Return top-n components ``(n_components, D)`` of zero-mean ``X``."""
+    X_c = X - X.mean(axis=0, keepdims=True)
+    # economy SVD: U(N,k) @ diag(S(k)) @ Vt(k,D)
+    _, _, Vt = np.linalg.svd(X_c, full_matrices=False)
+    return X_c, Vt[:n_components]
+
+
+def _save_feature_pca_grid(
+    z: torch.Tensor, original_imgs: torch.Tensor, vis_dir: str, seq_h: int,
+    filename: str, n_components: int = 3,
+):
+    """Project per-position features to top-3 PCs (treated as RGB) and save a
+    grid that interleaves originals with the PCA feature map for each sample.
+
+    z: ``(B, L, C)``; original_imgs: ``(B, 3, H, W)`` in ``[-1, 1]``.
+    """
+    import torchvision
+
+    z_np = z.detach().float().cpu().numpy()
+    B, L, C = z_np.shape
+    seq_w = L // seq_h
+
+    # global PCA over all batch positions for consistent colors across samples
+    flat = z_np.reshape(-1, C)
+    flat_c, comps = _pca_top_components(flat, n_components=n_components)
+    proj = flat_c @ comps.T  # (B*L, n_components)
+    p_min, p_max = proj.min(0, keepdims=True), proj.max(0, keepdims=True)
+    proj = (proj - p_min) / (p_max - p_min + 1e-8)
+
+    feat = proj.reshape(B, seq_h, seq_w, n_components).transpose(0, 3, 1, 2)
+    feat_t = torch.from_numpy(feat).float()
+
+    upscale = max(1, original_imgs.shape[-1] // seq_h)
+    feat_t = torch.nn.functional.interpolate(feat_t, scale_factor=upscale, mode="nearest")
+
+    orig = (original_imgs.float() * 0.5 + 0.5).clamp(0, 1).cpu()
+    # interleave [orig, feat, orig, feat, ...]
+    interleaved = torch.stack([orig, feat_t], dim=1).reshape(-1, *orig.shape[1:])
+    grid = torchvision.utils.make_grid(interleaved, nrow=2, padding=8, pad_value=1)
+    outpath = os.path.join(vis_dir, filename)
+    torchvision.utils.save_image(grid, outpath)
+    logger.info(f"Saved latent PCA feature maps at {outpath}")
+
+
+def _save_latent_distribution(
+    z: np.ndarray, labels: np.ndarray, vis_dir: str, filename: str,
+    do_tsne: bool = True,
+):
+    """Save a 2-panel scatter (PCA / t-SNE) of pooled latent features, colored by class.
+
+    z: ``(N, L, C)`` or ``(N, C)``; labels: ``(N,)``.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pooled = z.mean(axis=1) if z.ndim == 3 else z   # (N, C)
+    n_classes = int(labels.max()) + 1 if labels.size > 0 else 1
+    cmap = "tab10" if n_classes <= 10 else "tab20"
+
+    # PCA
+    p_c, p_vt = _pca_top_components(pooled, n_components=2)
+    pca_2d = p_c @ p_vt.T
+
+    # t-SNE (optional)
+    tsne_2d = None
+    if do_tsne and len(pooled) >= 5:
+        try:
+            from sklearn.manifold import TSNE
+            perp = max(5, min(30, len(pooled) // 4))
+            tsne_2d = TSNE(
+                n_components=2, perplexity=perp, init="pca", random_state=42,
+            ).fit_transform(pooled)
+        except Exception as e:
+            logger.warning(f"t-SNE skipped: {e}")
+
+    n_plots = 2 if tsne_2d is not None else 1
+    fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 6), squeeze=False)
+    sc = axes[0, 0].scatter(pca_2d[:, 0], pca_2d[:, 1], c=labels, cmap=cmap, s=12, alpha=0.7)
+    axes[0, 0].set_title(f"PCA  (n={len(pooled)}, classes={n_classes})")
+    if tsne_2d is not None:
+        axes[0, 1].scatter(tsne_2d[:, 0], tsne_2d[:, 1], c=labels, cmap=cmap, s=12, alpha=0.7)
+        axes[0, 1].set_title(f"t-SNE  (n={len(pooled)}, classes={n_classes})")
+    fig.colorbar(sc, ax=axes[0, :].tolist(), shrink=0.7, label="class")
+
+    outpath = os.path.join(vis_dir, filename)
+    plt.savefig(outpath, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Saved latent distribution at {outpath}")
+
+
+@torch.inference_mode()
+def visualize_latent(
+    args, model, ema_model, data_loader, epoch: int,
+    split: str = "vis", use_emas=(True,),
+    n_dist_samples: int = 256, n_feat_samples: int = 8,
+):
+    """Visualize latent ``z``:
+
+      1. **PCA feature maps**: for ``n_feat_samples`` samples, project per-position
+         features onto the top-3 PCs and treat those as RGB to render a feature image.
+         Saved interleaved with the originals.
+      2. **PCA / t-SNE distribution scatter**: pool ``z`` across spatial positions to
+         get one vector per sample, run PCA and t-SNE, scatter colored by label.
+    """
+    model.eval()
+    autoencoder = (model.module if hasattr(model, "module") else model).autoencoder
+    device = torch.device("cuda")
+
+    for use_ema in use_emas:
+        if use_ema and ema_model is not None:
+            ema_model.store(model)
+            ema_model.copy_to(model)
+
+        z_chunks, lbl_chunks = [], []
+        img_first, z_first = None, None
+        target_local = max(1, n_dist_samples // max(1, distributed.get_world_size()))
+        n_local = 0
+        for batch in data_loader:
+            imgs = batch["img"].to(device)
+            if "label" in batch:
+                lbls = batch["label"].to(device).long()
+            else:
+                lbls = torch.zeros(len(imgs), dtype=torch.long, device=device)
+
+            z, _, _ = autoencoder.encode(imgs, sampling=False, mask_ratio=0.0)
+            z_chunks.append(z)
+            lbl_chunks.append(lbls)
+            if img_first is None:
+                img_first = imgs[:n_feat_samples].cpu()
+                z_first = z[:n_feat_samples].cpu()
+            n_local += len(imgs)
+            if n_local >= target_local:
+                break
+
+        z_local = torch.cat(z_chunks, dim=0)
+        lbl_local = torch.cat(lbl_chunks, dim=0)
+        z_global = distributed.concat_all_gather(z_local).cpu().numpy()
+        lbl_global = distributed.concat_all_gather(lbl_local).cpu().numpy()
+
+        if distributed.is_main_process():
+            _save_feature_pca_grid(
+                z_first, img_first, args.vis_dir, autoencoder.seq_h,
+                f"ep{epoch:04d}_ema={use_ema}_{split}_latent_pca_features.jpg",
+            )
+            _save_latent_distribution(
+                z_global, lbl_global, args.vis_dir,
+                f"ep{epoch:04d}_ema={use_ema}_{split}_latent_dist.png",
+            )
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        torch.cuda.empty_cache()
+
+        if use_ema and ema_model is not None:
+            ema_model.restore(model)
+
+
+# =============================================================================
 # Joint model
 # =============================================================================
 
@@ -231,6 +395,7 @@ def create_ssldm_model(args: argparse.Namespace):
         gamma=0.0,
         latent_norm=getattr(args, "latent_norm", None),
         fixed_std=getattr(args, "fixed_std", None),
+        kl_reduction=getattr(args, "kl_loss_reduction", "sum"),
     )
     diffusion_model = models.LightningDiT_Flow_models[args.dm_model](
         img_size=args.img_size,
@@ -410,6 +575,60 @@ def _ckpt_resume(
 # =============================================================================
 
 
+@torch.no_grad()
+def _posterior_stats(posteriors) -> dict:
+    """Summary statistics of the predicted posterior (mean, logvar, std).
+
+    All values are reduced to scalars (then averaged across ranks downstream).
+
+    All "spread" stats are computed **along the batch dim first** then averaged
+    across the remaining (spatial, channel) dims — i.e. ``x.std(dim=0).mean()``
+    rather than ``x.std()`` over all dims pooled together. This separates
+    inter-sample variation from intra-token/-channel variation.
+
+    Stats reported
+    --------------
+    Spread of the mean (along batch dim):
+      ``post/mean_avg``           — average value (should drift toward 0 if KL-pulled).
+      ``post/mean_std``           — ``mean.std(dim=0).mean()``: per-(token,channel) std
+                                    across the batch, averaged. Drops ⇒ posterior collapse.
+      ``post/mean_abs_avg``       — average magnitude.
+    Norms (per-position L2):
+      ``post/mean_norm_avg``      — average ``||mean||₂`` over channel dim.
+      ``post/std_norm_avg``       — average ``||std||₂`` over channel dim.
+    Stochasticity (logvar / std):
+      ``post/std_avg``            — average per-element std.
+      ``post/logvar_avg``         — average logvar.
+      ``post/logvar_std``         — ``logvar.std(dim=0).mean()`` (zero when ``fixed_std``).
+    Channel-collapse indicators (pool batch+spatial, look across channels):
+      ``post/mean_chan_std_avg``  — per-channel std-of-mean-across-data, averaged.
+                                    Small ⇒ many channels are collapsed.
+      ``post/mean_chan_std_min``  — minimum across channels (worst-collapsed dim).
+      ``post/active_dim_frac``    — fraction of channels with std-of-mean > 0.01.
+    """
+    mean = posteriors.mean.detach().float()
+    logvar = posteriors.logvar.detach().float()
+    std = posteriors.std.detach().float()
+
+    # last dim is the channel dim (see DiagonalGaussianDistribution with channel_dim=-1)
+    non_chan_dims = tuple(range(mean.ndim - 1))  # (batch, ..., spatial)
+
+    per_chan_mean_std = mean.std(dim=non_chan_dims)  # (C,)
+    return {
+        "post/mean_avg":          mean.flatten(1).mean(),
+        "post/mean_std":          mean.flatten(1).std(dim=0).mean(),
+        "post/mean_abs_avg":      mean.flatten(1).abs().mean(),
+        "post/mean_norm_avg":     mean.flatten(1).norm(dim=-1).mean(),
+        "post/std_norm_avg":      std.flatten(1).norm(dim=-1).mean(),
+        "post/std_avg":           std.flatten(1).mean(),
+        "post/logvar_avg":        logvar.flatten(1).mean(),
+        "post/logvar_std":        logvar.flatten(1).std(dim=0).mean(),
+        "post/mean_chan_std_avg": per_chan_mean_std.mean(),
+        "post/mean_chan_std_min": per_chan_mean_std.min(),
+        "post/active_dim_frac":   (per_chan_mean_std > 0.01).float().mean(),
+    }
+
+
 def _generator_update(combined_loss, loss_scaler, opt_specs, grad_clip):
     """Backward + clip + step for the generator (AE + DM) loss.
 
@@ -472,6 +691,7 @@ def train_one_epoch_ssldm(
 
             loss_dict["diffusion_loss"] = diff_loss.detach()
             loss_dict["weighted_diffusion_loss"] = (args.diffusion_weight * diff_loss).detach()
+            loss_dict.update(_posterior_stats(posteriors))
 
             autoencoder_logs = {}
             for k, v in loss_dict.items():
@@ -598,9 +818,10 @@ def main(args: argparse.Namespace) -> int:
 
     # initial autoencoder visualization
     try:
-        visualize_tokenizer(args, model_wo_ddp, ema_model, next(vis_iterator), args.start_epoch)
+        visualize_tokenizer(args, model_wo_ddp, ema_model, next(vis_iterator), args.start_epoch, use_emas=[False, True])
     except StopIteration:
         pass
+    visualize_latent(args, model_wo_ddp, ema_model, data_loader_vis, args.start_epoch)
 
     if args.evaluate:
         torch.cuda.empty_cache()
@@ -610,7 +831,7 @@ def main(args: argparse.Namespace) -> int:
             )
         if args.online_eval_gen:
             evaluate_generator(
-                args, model_wo_ddp, ema_model, tokenizer=None,
+                args, model_wo_ddp, ema_model, tokenizer=model_wo_ddp,
                 epoch=args.start_epoch, wandb_logger=wandb_logger,
                 use_ema=True, cfg=args.cfg, num_images=args.num_images,
             )
@@ -643,12 +864,15 @@ def main(args: argparse.Namespace) -> int:
 
         if (epoch + 1) % args.vis_freq == 0:
             try:
-                visualize_tokenizer(args, model_wo_ddp, ema_model, next(vis_iterator), epoch)
+                visualize_tokenizer(args, model_wo_ddp, ema_model, next(vis_iterator), epoch + 1, use_emas=[False, True])
             except StopIteration:
                 vis_iterator = iter(data_loader_vis)
-                visualize_tokenizer(args, model_wo_ddp, ema_model, next(vis_iterator), epoch)
-            if args.gen_vis_freq > 0 and (epoch + 1) % args.gen_vis_freq == 0:
-                visualize_generator(args, model_wo_ddp, ema_model, tokenizer=None, epoch=epoch + 1)
+                visualize_tokenizer(args, model_wo_ddp, ema_model, next(vis_iterator), epoch + 1, use_emas=[False, True])
+            visualize_latent(args, model_wo_ddp, ema_model, data_loader_vis, epoch + 1)
+            # if args.gen_vis_freq > 0 :
+            visualize_generator(args, model_wo_ddp, ema_model, tokenizer=model_wo_ddp, epoch=epoch + 1)
+
+            
 
         if args.online_eval and (epoch + 1) % args.eval_freq == 0 and (epoch + 1) != args.epochs:
             torch.cuda.empty_cache()
@@ -658,7 +882,7 @@ def main(args: argparse.Namespace) -> int:
                 )
             if args.online_eval_gen:
                 evaluate_generator(
-                    args, model_wo_ddp, ema_model, tokenizer=None,
+                    args, model_wo_ddp, ema_model, tokenizer=model_wo_ddp,
                     epoch=epoch + 1, wandb_logger=wandb_logger,
                     use_ema=True, cfg=args.cfg, num_images=args.num_images_for_eval_and_search,
                 )
@@ -670,7 +894,7 @@ def main(args: argparse.Namespace) -> int:
         evaluate_tokenizer(args, model_wo_ddp, ema_model, data_loader_val, args.epochs, wandb_logger, use_ema)
     if args.online_eval_gen:
         evaluate_generator(
-            args, model_wo_ddp, ema_model, tokenizer=None,
+            args, model_wo_ddp, ema_model, tokenizer=model_wo_ddp,
             epoch=args.epochs, wandb_logger=wandb_logger,
             use_ema=True, cfg=args.cfg, num_images=args.num_images,
         )
@@ -699,11 +923,11 @@ def get_args_parser():
 
     # logging parameters
     parser.add_argument("--output_dir", default="./work_dirs")
-    parser.add_argument("--print_freq", type=int, default=100)
+    parser.add_argument("--print_freq", type=int, default=10)
     parser.add_argument("--eval_freq", type=int, default=10)
     parser.add_argument("--vis_freq", type=int, default=5)
-    parser.add_argument("--gen_vis_freq", type=int, default=0,
-                        help="If >0, run visualize_generator every N epochs")
+    # parser.add_argument("--gen_vis_freq", type=int, default=0,
+    #                     help="If >0, run visualize_generator every N epochs")
     parser.add_argument("--save_freq", type=int, default=1)
     parser.add_argument("--last_elapsed_time", type=float, default=0.0)
 

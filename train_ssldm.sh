@@ -13,7 +13,7 @@ WANDB_KEY="4ab8d4a0db9aec6c80956ccf58616de15392a463"
 # DATA_PATH=/dataset/imagenet/train
 # NPROC=4
 
-EXP_NAME=0517_ssldm_base
+EXP_NAME=0517_ssldm_sg
 EXPS_DIR=exps
 CONFIG=$EXPS_DIR/$PROJECT/$EXP_NAME/config.yaml
 DATA_PATH=/dataset/imagenet/train
@@ -21,12 +21,11 @@ NPROC=4
 
 torchrun --standalone --nproc_per_node=$NPROC train_ssldm.py \
     --config $CONFIG \
-    --output_dir $EXPS_DIR/$EXP_NAME \
+    --output_dir $EXPS_DIR \
     --dataset mnist \
-    --print_freq 50 \
+    --print_freq 10 \
     --eval_freq 50 \
-    --vis_freq 4 \
-    --gen_vis_freq 4 \
+    --vis_freq 1 \
     --save_freq 1 \
     --auto_resume \
     --keep_n_ckpts 1 \
@@ -42,5 +41,5 @@ torchrun --standalone --nproc_per_node=$NPROC train_ssldm.py \
     --project $PROJECT \
     --entity $ENTITY \
     --exp_name $EXP_NAME \
-    --enable_wandb \
-    --wandb_key $WANDB_KEY
+    # --enable_wandb \
+    # --wandb_key $WANDB_KEY

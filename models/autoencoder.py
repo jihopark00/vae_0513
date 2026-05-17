@@ -370,12 +370,18 @@ class Decoder(nn.Module):
 
 
 class DiagonalGaussianDistribution(object):
-    def __init__(self, parameters, deterministic=False, channel_dim=1):
+    def __init__(self, parameters, deterministic=False, channel_dim=1, reduction="sum"):
+        if reduction not in ("sum", "mean"):
+            raise ValueError(f"reduction must be 'sum' or 'mean', got {reduction!r}")
+        # Chunk from the float-promoted tensor so mean/logvar/std/var are all
+        # float32 — keeps KL stable and avoids dtype mismatches when downstream
+        # consumers (e.g. sigreg's f32 random projections) matmul against these.
         self.parameters = parameters.float()
-        self.mean, self.logvar = torch.chunk(parameters, 2, dim=channel_dim)
+        self.mean, self.logvar = torch.chunk(self.parameters, 2, dim=channel_dim)
         self.sum_dims = tuple(range(1, self.mean.dim()))
         self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
         self.deterministic = deterministic
+        self.reduction = reduction
         self.std = torch.exp(0.5 * self.logvar)
         self.var = torch.exp(self.logvar)
         if self.deterministic:
@@ -386,25 +392,28 @@ class DiagonalGaussianDistribution(object):
         x = self.mean + self.std * torch.randn(self.mean.shape).to(device=self.parameters.device)
         return x
 
+    def _reduce(self, x: torch.Tensor) -> torch.Tensor:
+        if self.reduction == "sum":
+            return torch.sum(x, dim=self.sum_dims)
+        return torch.mean(x, dim=self.sum_dims)
+
     @torch.autocast("cuda", enabled=False)
     def kl(self, other=None):
         if self.deterministic:
-            return torch.Tensor([0.0])
+            return torch.zeros(self.mean.shape[0], device=self.mean.device, dtype=self.mean.dtype)
+        if other is None:
+            per_elem = 0.5 * (
+                torch.pow(self.mean, 2) + self.var - 1.0 - self.logvar
+            )
         else:
-            if other is None:
-                return 0.5 * torch.sum(
-                    torch.pow(self.mean, 2) + self.var - 1.0 - self.logvar,
-                    dim=self.sum_dims,
-                )
-            else:
-                return 0.5 * torch.sum(
-                    torch.pow(self.mean - other.mean, 2) / other.var
-                    + self.var / other.var
-                    - 1.0
-                    - self.logvar
-                    + other.logvar,
-                    dim=self.sum_dims,
-                )
+            per_elem = 0.5 * (
+                torch.pow(self.mean - other.mean, 2) / other.var
+                + self.var / other.var
+                - 1.0
+                - self.logvar
+                + other.logvar
+            )
+        return self._reduce(per_elem)
 
     @torch.autocast("cuda", enabled=False)
     def nll(self, sample, dims=None):

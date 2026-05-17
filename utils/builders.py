@@ -337,6 +337,17 @@ def create_loss_module(args):
         sigreg_npoints=getattr(args, "sigreg_npoints", 17),
         sigreg_nslices=getattr(args, "sigreg_nslices", 100),
         sigreg_on_mu=getattr(args, "sigreg_on_mu", False),
+        use_weak_sigreg=getattr(args, "use_weak_sigreg", False),
+        weak_sigreg_weight=getattr(args, "weak_sigreg_weight", 0.0),
+        weak_sigreg_sketch_dim=getattr(args, "weak_sigreg_sketch_dim", 64),
+        weak_sigreg_on_mu=getattr(args, "weak_sigreg_on_mu", False),
+        use_var_reg=getattr(args, "use_var_reg", False),
+        var_reg_weight=getattr(args, "var_reg_weight", 0.0),
+        var_reg_eps=getattr(args, "var_reg_eps", 1e-4),
+        var_reg_on_mu=getattr(args, "var_reg_on_mu", False),
+        use_cov_reg=getattr(args, "use_cov_reg", False),
+        cov_reg_weight=getattr(args, "cov_reg_weight", 0.0),
+        cov_reg_on_mu=getattr(args, "cov_reg_on_mu", False),
     )
     loss_module.cuda()
     logger.info("====Loss Module=====")
