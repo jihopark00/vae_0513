@@ -1,0 +1,69 @@
+# Joint SSL + Diffusion training config (consumed by train_ssldm.py).
+# Sections: autoencoder / diffusion model / loss weights / optimization / seed.
+# Everything else (logging, checkpointing, dataset, wandb) stays on the CLI.
+
+# ===== Autoencoder =====
+ae_model: detok_ssldm_BB
+token_channels: 768
+img_size: 256
+patch_size: 16
+latent_norm: layernorm      # null | layernorm | rmsnorm | batchnorm
+fixed_std: null        # null = predict logvar; float = force posterior std to this value
+
+# ===== Diffusion model =====
+dm_model: LightningDiT_Flow_base
+dm_patch_size: 1
+label_drop_prob: 0.1
+num_classes: 1000
+num_sampling_steps: 250
+prediction: data
+loss_target: data
+qk_norm: false
+grad_checkpointing: false
+detach_zt: false
+detach_target: true
+t_eps: 0.05
+P_mean: 0.0
+P_std: 1.0
+noise_scale: 1.0
+cfg_interval_start: 0.10
+
+# ===== Loss weights =====
+diffusion_weight: 1.0
+reconstruction_loss: l2          # l1 | l2 | l2+l1
+reconstruction_weight: 1.0
+perceptual_loss: lpips-convnext_s-1.0-0.1
+perceptual_weight: 0.0
+discriminator_start_epoch: 100
+discriminator_weight: 0.1
+kl_loss_weight: 1.0e-6
+use_sigreg: false
+sigreg_weight: 0.0
+sigreg_npoints: 17
+sigreg_nslices: 256
+sigreg_on_mu: false
+
+# ===== Optimization =====
+# When separate_optimizers=false: a single optimizer is built over the whole
+# joint model using the keys below (lr, blr, weight_decay, beta1, beta2, ...).
+# When true: ae_opt / dm_opt override the per-component values; any key left
+# unset falls back to the top-level value.
+separate_optimizers: false
+start_epoch: 0
+epochs: 200
+batch_size: 128
+lr: 1.0e-4
+blr: 1.0e-4
+min_lr: 0.0
+lr_sched: constant          # constant | cosine
+warmup_rate: 0.0
+weight_decay: 1.0e-4
+grad_clip: 3.0
+beta1: 0.9
+beta2: 0.95
+ema_rate: 0.0
+
+ae_opt: null   # e.g. {blr: 1.0e-4, weight_decay: 1.0e-4, beta1: 0.9, beta2: 0.95}
+dm_opt: null   # e.g. {blr: 1.0e-4, weight_decay: 0.02,   beta1: 0.9, beta2: 0.95}
+
+seed: 42

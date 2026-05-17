@@ -1,0 +1,15 @@
+
+reference: 
+
+
+write models/lightningdit_flow.py ( LightningDiT_Flow )
+use the original lightningdit architecture.
+add arguments and support them.
+- prediction = "velocity" or "data"
+- loss_target = "velocity" or "data"
+- t_eps (when data prediction and computing velocity)
+
+follow the reference: /home/ljeadec31/opt/ssl/JiT. 
+do not follow the previous transport, do not use external transport. 
+(e.g, Instead of using t=0 as data, t=1.0 as noise, use t=0 as noise and t=1 as data.)
+

@@ -1,0 +1,69 @@
+write train_ssldm.py
+
+Jointly train AutoEncoder (models/detok.py) and Diffusion model (models/lightningdit_flow.py).
+- for detok, we are not going to use noising options. it should be just autoencoder with regularization loss (i.e., mask_ratio: 0.0, gamma: 0.0)
+- reference training code format: train_reconstruction.py
+- use config yaml for main args, and use args for additional args.
+e.g.,
+"
+def get_args_parser():
+    parser = argparse.ArgumentParser("Reconstruction model training", add_help=False)
+
+    # YAML config (provides model / loss / optimization / seed)
+    parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
+
+    # logging parameters
+    parser.add_argument("--output_dir", default="./work_dirs")
+    parser.add_argument("--print_freq", type=int, default=100)
+    parser.add_argument("--eval_freq", type=int, default=10)
+    parser.add_argument("--vis_freq", type=int, default=5)
+    parser.add_argument("--save_freq", type=int, default=1)
+    parser.add_argument("--last_elapsed_time", type=float, default=0.0)
+
+    # checkpoint parameters
+    parser.add_argument("--auto_resume", action="store_true")
+    parser.add_argument("--resume_from", default=None, help="resume model weights and optimizer state")
+    parser.add_argument("--load_from", type=str, default=None, help="load from pretrained model")
+    parser.add_argument("--keep_n_ckpts", default=1, type=int, help="keep the last n checkpoints")
+    parser.add_argument("--milestone_interval", default=100, type=int, help="keep checkpoints every n epochs")
+
+    # evaluation parameters
+    parser.add_argument("--num_images", default=50000, type=int, help="Number of images to evaluate on")
+    parser.add_argument("--online_eval", action="store_true")
+    parser.add_argument("--fid_stats_path", type=str, default="data/fid_stats/val_fid_statistics_file.npz")
+    parser.add_argument("--keep_eval_folder", action="store_true")
+    parser.add_argument("--evaluate", action="store_true")
+    parser.add_argument("--eval_bsz", type=int, default=256)
+
+    # dataset parameters
+    parser.add_argument("--use_cached_tokens", action="store_true")
+    parser.add_argument("--data_path", default="./data/imagenet/train", type=str)
+    parser.add_argument("--num_classes", default=1000, type=int)
+    parser.add_argument("--class_of_interest", default=[207, 360, 387, 974, 88, 979, 417, 279], type=int, nargs="+")
+    parser.add_argument("--num_workers", default=10, type=int)
+    parser.add_argument("--pin_mem", action="store_true")
+    parser.add_argument("--no_pin_mem", action="store_false", dest="pin_mem")
+    parser.set_defaults(pin_mem=True)
+
+    # wandb parameters
+    parser.add_argument("--project", default="lDeTok", type=str)
+    parser.add_argument("--entity", default="YOUR_WANDB_ENTITY", type=str)
+    parser.add_argument("--exp_name", default=None, type=str)
+    parser.add_argument("--enable_wandb", action="store_true")
+    parser.add_argument("--wandb_key", default=None, type=str, help="W&B API key for wandb.login")
+
+    return parser
+"
+
+
+model flow:
+- x --(encoder)--> z
+- x: data, y: condition, z: latent, x_recon
+- z, y --(diffusion model forward)--> diffusion loss
+- z --(decoder)--> x_pred --> recon loss (optional lpips, gan loss)
+- (ToDo) additional regularization loss for z
+
+
+optimizer
+- if not specified, use same optimizer setting for autoencoder and diffusion model. 
+- add option, if specified, use seperate optimizer autoencoder and diffusion model. 
